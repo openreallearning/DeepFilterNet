@@ -1,0 +1,6 @@
+[submodule "onnxruntime"]
+	path = onnxruntime
+	url = https://github.com/microsoft/onnxruntime.git
+[submodule "libsndfile"]
+	path = libsndfile
+	url = https://github.com/libsndfile/libsndfile.git
