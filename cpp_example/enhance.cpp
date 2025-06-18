@@ -242,6 +242,13 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       }
     }
 
+    // Update DF history with the ERB-masked spectrum
+    spec_hist.pop_front();
+    spec_hist.emplace_back(n_freq);
+    for (size_t k = 0; k < n_freq; ++k) {
+      spec_hist.back()[k] = spec[k];
+    }
+
     if (!only_noise_detected && !clean_speech_signal && !only_little_noise_detected) {
       // Apply DF
       // DF dec convolution
