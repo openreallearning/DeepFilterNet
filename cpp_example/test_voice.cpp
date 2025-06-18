@@ -46,7 +46,9 @@ int main() {
     auto enhanced = read_wav("enhanced.wav", sr2);
     enhanced.resize(sr);
     float snr_noisy = snr(clean, noisy);
+    std::cout << "SNR noisy: " << snr_noisy << std::endl;
     float snr_enh = snr(clean, enhanced);
+    std::cout << "SNR enhanced: " << snr_enh << std::endl;
     if(snr_enh > snr_noisy) return 0;
     std::cerr << "SNR did not improve\n";
     return 1;
