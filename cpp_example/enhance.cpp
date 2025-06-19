@@ -149,7 +149,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   size_t frames = (audio.size() + hop - 1) / hop;
   size_t lookahead = std::max(cfg.conv_lookahead, cfg.df_lookahead);
   size_t proc_frames = frames + lookahead;
-  std::vector<float> out(audio.size() + cfg.fft_size, 0.f);
+  size_t delay = (cfg.fft_size - hop) + lookahead * hop;
+  std::vector<float> out(audio.size() + delay + cfg.fft_size, 0.f);
   std::vector<float> frame(cfg.fft_size);
   std::vector<std::complex<float>> spec(cfg.fft_size);
   // Store the full spectrum for each frame to allow inverse transforms
@@ -292,6 +293,11 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       }
     }
 
+    // Ensure conjugate symmetry for real iDFT
+    for (size_t k = 1; k < n_freq - 1; ++k) {
+      spec_out[cfg.fft_size - k] = std::conj(spec_out[k]);
+    }
+
     std::vector<float> time(cfg.fft_size);
     idft(spec_out, time);
     size_t start = t * hop;
@@ -308,7 +314,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     std::cerr << "Failed to open output" << std::endl;
     return 1;
   }
-  sf_writef_float(outfile, out.data(), info.frames);
+  sf_writef_float(outfile, out.data() + delay, info.frames);
   sf_close(outfile);
   std::filesystem::remove_all(tmpdir);
   return 0;
