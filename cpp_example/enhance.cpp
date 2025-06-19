@@ -154,8 +154,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   std::vector<float> out(audio.size() + delay + cfg.fft_size, 0.f);
   std::vector<float> frame(cfg.fft_size);
   std::vector<std::complex<float>> spec(cfg.fft_size);
-  // Store the full spectrum for each frame to allow inverse transforms
-  std::vector<std::vector<std::complex<float>>> spec_buf(
+  // Store the noisy spectrum for each frame
+  std::vector<std::vector<std::complex<float>>> spec_noisy(
       proc_frames, std::vector<std::complex<float>>(cfg.fft_size));
   for (size_t f = 0; f < proc_frames; ++f) {
     size_t start = f * hop;
@@ -167,8 +167,11 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     }
     dft(frame, spec);
     for (size_t k = 0; k < cfg.fft_size; ++k)
-      spec_buf[f][k] = spec[k];
+      spec_noisy[f][k] = spec[k];
   }
+
+  // Processing buffer starts with the noisy spectrum
+  auto spec_proc = spec_noisy;
 
   std::vector<float> erb_feat(cfg.nb_erb);
   std::array<int64_t, 4> enc_in1_shape{1, 1, 1, cfg.nb_erb};
@@ -185,7 +188,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   const char *dec_output_names[] = {"m"};
 
   for (size_t t = 0; t < proc_frames - cfg.conv_lookahead; ++t) {
-    const auto &spec_in = spec_buf[t + cfg.conv_lookahead];
+    const auto &spec_in = spec_noisy[t + cfg.conv_lookahead];
     for (int b = 0; b < cfg.nb_erb; ++b) {
       size_t b_start = b * n_freq / cfg.nb_erb;
       size_t b_end = (b + 1) * n_freq / cfg.nb_erb;
@@ -233,7 +236,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     std::cout << std::endl;
 
     std::vector<float> gain_freq(n_freq, 1);
-    std::vector<std::complex<float>> spec_out = spec_buf[t];
+    std::vector<std::complex<float>> spec_out = spec_proc[t];
     std::vector<std::complex<float>> spec_df(cfg.nb_df);
 
     if (!only_noise_detected && !clean_speech_signal) {
@@ -258,6 +261,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       for (size_t k = 0; k < n_freq; ++k) {
         spec_out[k] *= gain_freq[k];
       }
+      spec_proc[t] = spec_out; // store stage 1 output for DF history
     }
 
     if (!only_noise_detected && !clean_speech_signal && !only_little_noise_detected) {
@@ -274,9 +278,9 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       for (size_t o = 0; o < cfg.df_order; ++o) {
         int hist_idx = static_cast<int>(t) - static_cast<int>(cfg.df_order) + 1 +
                         static_cast<int>(o) + static_cast<int>(cfg.df_lookahead);
-        if (hist_idx < 0 || hist_idx >= static_cast<int>(spec_buf.size()))
+        if (hist_idx < 0 || hist_idx >= static_cast<int>(spec_proc.size()))
           continue;
-        const auto &hist = spec_buf[hist_idx];
+        const auto &hist = spec_proc[hist_idx];
         for (size_t k = 0; k < cfg.nb_df; ++k) {
           size_t idx = k * (cfg.df_order * 2) + 2 * o;
           std::complex<float> c(coefs[idx], coefs[idx + 1]);
