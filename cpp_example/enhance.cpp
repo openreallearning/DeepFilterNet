@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <onnxruntime/core/session/onnxruntime_cxx_api.h>
 #include <sndfile.h>
 #include <sstream>
@@ -98,6 +99,19 @@ static void idft(const std::vector<std::complex<float>> &in,
       sum += in[k] * std::complex<float>(std::cos(angle), std::sin(angle));
     }
     out[n] = sum.real() / N;
+  }
+}
+
+static void post_filter(const std::vector<std::complex<float>> &noisy,
+                        std::vector<std::complex<float>> &enh, float beta) {
+  const float beta_p1 = beta + 1.f;
+  const float eps = 1e-12f;
+  for (size_t k = 0; k < noisy.size() && k < enh.size(); ++k) {
+    float g = std::abs(enh[k]) / (std::abs(noisy[k]) + eps);
+    g = std::clamp(g, eps, 1.f);
+    float g_sin = g * std::sin(g * M_PI / 2.f);
+    float pf = (beta_p1 * g / (1.f + beta * std::pow(g / g_sin, 2.f))) / g;
+    enh[k] *= pf;
   }
 }
 
@@ -300,6 +314,10 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       for (size_t k = 0; k < cfg.nb_df; ++k)
         spec_out[k] = spec_df[k];
     }
+
+    const float post_filter_beta = 0.02f;
+    if (produce_output)
+      post_filter(spec_noisy[out_idx], spec_out, post_filter_beta);
 
     if (false) {
       float atten_lim = std::pow(10.f, -attention_limit_parameter / 20.f);
