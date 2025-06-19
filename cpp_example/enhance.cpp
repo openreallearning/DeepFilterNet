@@ -21,6 +21,8 @@ struct Config {
   int nb_erb = 0;
   int nb_df = 0;
   int df_order = 0;
+  int conv_lookahead = 0;
+  int df_lookahead = 0;
 };
 
 static Config parse_config(const std::string &path) {
@@ -55,6 +57,10 @@ static Config parse_config(const std::string &path) {
         c.nb_df = std::stoi(val);
       else if (key == "df_order")
         c.df_order = std::stoi(val);
+      else if (key == "conv_lookahead")
+        c.conv_lookahead = std::stoi(val);
+      else if (key == "df_lookahead")
+        c.df_lookahead = std::stoi(val);
     }
   }
   return c;
@@ -141,15 +147,36 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
 
   size_t hop = cfg.hop_size;
   size_t frames = (audio.size() + hop - 1) / hop;
-  std::vector<float> out(audio.size() + cfg.fft_size, 0.f);
+  size_t lookahead = std::max(cfg.conv_lookahead, cfg.df_lookahead);
+  // Process additional frames to flush lookahead at the end
+  size_t proc_frames = frames + lookahead + cfg.conv_lookahead;
+  size_t delay = (cfg.fft_size - hop) + lookahead * hop;
+  std::vector<float> out(audio.size() + delay + cfg.fft_size, 0.f);
   std::vector<float> frame(cfg.fft_size);
   std::vector<std::complex<float>> spec(cfg.fft_size);
+  // Store the noisy spectrum for each frame
+  std::vector<std::vector<std::complex<float>>> spec_noisy(
+      proc_frames, std::vector<std::complex<float>>(cfg.fft_size));
+  for (size_t f = 0; f < proc_frames; ++f) {
+    size_t start = f * hop;
+    for (size_t i = 0; i < cfg.fft_size; ++i) {
+      float s = 0.f;
+      if (start + i < audio.size())
+        s = audio[start + i];
+      frame[i] = s * window[i];
+    }
+    dft(frame, spec);
+    for (size_t k = 0; k < cfg.fft_size; ++k)
+      spec_noisy[f][k] = spec[k];
+  }
+
+  // Processing buffer with stage-1 output
+  auto spec_proc = spec_noisy;
+
   std::vector<float> erb_feat(cfg.nb_erb);
   std::array<int64_t, 4> enc_in1_shape{1, 1, 1, cfg.nb_erb};
   std::array<int64_t, 4> enc_in2_shape{1, 2, 1, cfg.nb_df};
   std::vector<float> spec_feat(cfg.nb_df * 2);
-  std::deque<std::vector<std::complex<float>>> spec_hist(
-      cfg.df_order, std::vector<std::complex<float>>(n_freq));
 
   Ort::AllocatorWithDefaultOptions allocator;
   Ort::MemoryInfo mem_info =
@@ -160,29 +187,22 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   const char *dec_input_names[] = {"emb", "e3", "e2", "e1", "e0"};
   const char *dec_output_names[] = {"m"};
 
-  for (size_t f = 0; f < frames; ++f) {
-    size_t start = f * hop;
-    for (size_t i = 0; i < cfg.fft_size; ++i) {
-      float s = 0.f;
-      if (start + i < audio.size())
-        s = audio[start + i];
-      frame[i] = s * window[i];
-    }
-    dft(frame, spec);
+  for (size_t t = 0; t < proc_frames; ++t) {
+    const auto &spec_in = spec_noisy[t];
     for (int b = 0; b < cfg.nb_erb; ++b) {
       size_t b_start = b * n_freq / cfg.nb_erb;
       size_t b_end = (b + 1) * n_freq / cfg.nb_erb;
       float acc = 0.f;
       size_t count = 0;
       for (size_t k = b_start; k < b_end; ++k) {
-        acc += std::abs(spec[k]);
+        acc += std::abs(spec_in[k]);
         ++count;
       }
       erb_feat[b] = count ? acc / count : 0.f;
     }
     for (int k = 0; k < cfg.nb_df; ++k) {
-      spec_feat[k] = spec[k].real();
-      spec_feat[cfg.nb_df + k] = spec[k].imag();
+      spec_feat[k] = spec_in[k].real();
+      spec_feat[cfg.nb_df + k] = spec_in[k].imag();
     }
     std::vector<Ort::Value> enc_inputs;
     enc_inputs.emplace_back(Ort::Value::CreateTensor<float>(
@@ -198,9 +218,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     auto emb = std::move(enc_out[4]);
     auto lsnr = enc_out[5].GetTensorMutableData<float>()[0];
 
-
     const float attention_limit_parameter = 100, // db
-        min_db_threshould = -6.5,                 // db
+        min_db_threshould = -6.5,                // db
         max_db_erb_threshould = 30,              // db
         max_db_df_threshould = 20;               // db
 
@@ -210,13 +229,25 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     bool only_little_noise_detected = lsnr > max_db_df_threshould;
 
     std::cout << "Local SNR: " << lsnr << " ";
-    if (clean_speech_signal) std::cout << " clean ";
-    if (only_noise_detected) std::cout << " NOISE ";
-    if (only_little_noise_detected) std::cout << " noise ";
+    if (clean_speech_signal)
+      std::cout << " clean ";
+    if (only_noise_detected)
+      std::cout << " NOISE ";
+    if (only_little_noise_detected)
+      std::cout << " noise ";
     std::cout << std::endl;
 
     std::vector<float> gain_freq(n_freq, 1);
-    std::vector<std::complex<float>> spec_df = spec;
+    size_t out_idx = 0;
+    if (t < static_cast<size_t>(cfg.conv_lookahead)) {
+      spec_proc[t] = spec_in;
+      continue;
+    } else {
+      out_idx = t - cfg.conv_lookahead;
+    }
+
+    std::vector<std::complex<float>> spec_out = spec_proc[out_idx];
+    std::vector<std::complex<float>> spec_df(cfg.nb_df);
 
     if (!only_noise_detected && !clean_speech_signal) {
       // Apply ERB gains
@@ -238,11 +269,13 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
         gain_freq[k] = gains[b];
       }
       for (size_t k = 0; k < n_freq; ++k) {
-        spec[k] *= gain_freq[k];
+        spec_out[k] *= gain_freq[k];
       }
+      spec_proc[out_idx] = spec_out; // store stage 1 output for DF history
     }
 
-    if (!only_noise_detected && !clean_speech_signal && !only_little_noise_detected) {
+    if (!only_noise_detected && !clean_speech_signal &&
+        !only_little_noise_detected) {
       // Apply DF
       // DF dec convolution
       const char *df_dec_input_names[] = {"emb", "c0"};
@@ -252,10 +285,14 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
                                df_dec_inputs.data(), df_dec_inputs.size(),
                                df_dec_output_names, 1);
       float *coefs = df_out[0].GetTensorMutableData<float>();
-      for (size_t k = 0; k < cfg.nb_df; ++k)
-        spec_df[k] = 0.f;
+      std::fill(spec_df.begin(), spec_df.end(), std::complex<float>{0.f, 0.f});
       for (size_t o = 0; o < cfg.df_order; ++o) {
-        const auto &hist = spec_hist[o];
+        int hist_idx = static_cast<int>(out_idx) -
+                       static_cast<int>(cfg.df_order) + 1 +
+                       static_cast<int>(o) + static_cast<int>(cfg.df_lookahead);
+        if (hist_idx < 0 || hist_idx >= static_cast<int>(spec_proc.size()))
+          continue;
+        const auto &hist = spec_proc[hist_idx];
         for (size_t k = 0; k < cfg.nb_df; ++k) {
           size_t idx = k * (cfg.df_order * 2) + 2 * o;
           std::complex<float> c(coefs[idx], coefs[idx + 1]);
@@ -263,22 +300,29 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
         }
       }
       for (size_t k = 0; k < cfg.nb_df; ++k)
-        spec[k] *= spec_df[k];
+        spec_out[k] = spec_df[k];
     }
 
     if (false) {
       float atten_lim = std::pow(10.f, -attention_limit_parameter / 20.f);
       for (size_t k = 0; k < n_freq; ++k) {
-        spec[k] = spec[k] * (1.f - atten_lim) + spec[k] * atten_lim;
+        spec_out[k] = spec_out[k] * (1.f - atten_lim) + spec_out[k] * atten_lim;
       }
     }
 
+    // Ensure conjugate symmetry for real iDFT
+    for (size_t k = 1; k < n_freq - 1; ++k) {
+      spec_out[cfg.fft_size - k] = std::conj(spec_out[k]);
+    }
+
     std::vector<float> time(cfg.fft_size);
-    idft(spec, time);
+    idft(spec_out, time);
+    size_t start = out_idx * hop;
     for (size_t i = 0; i < cfg.fft_size; ++i) {
-      if (only_noise_detected) out[start + i] = 0;
+      if (only_noise_detected)
+        out[start + i] = 0;
       else
-      out[start + i] += time[i] * window[i];
+        out[start + i] += time[i] * window[i];
     }
   }
 
@@ -288,7 +332,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     std::cerr << "Failed to open output" << std::endl;
     return 1;
   }
-  sf_writef_float(outfile, out.data(), info.frames);
+  sf_writef_float(outfile, out.data() + delay, info.frames);
   sf_close(outfile);
   std::filesystem::remove_all(tmpdir);
   return 0;
