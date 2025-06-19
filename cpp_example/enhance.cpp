@@ -148,7 +148,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   size_t hop = cfg.hop_size;
   size_t frames = (audio.size() + hop - 1) / hop;
   size_t lookahead = std::max(cfg.conv_lookahead, cfg.df_lookahead);
-  size_t proc_frames = frames + lookahead;
+  // Process additional frames to flush lookahead at the end
+  size_t proc_frames = frames + lookahead + cfg.conv_lookahead;
   size_t delay = (cfg.fft_size - hop) + lookahead * hop;
   std::vector<float> out(audio.size() + delay + cfg.fft_size, 0.f);
   std::vector<float> frame(cfg.fft_size);
@@ -183,7 +184,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   const char *dec_input_names[] = {"emb", "e3", "e2", "e1", "e0"};
   const char *dec_output_names[] = {"m"};
 
-  for (size_t t = 0; t < frames; ++t) {
+  for (size_t t = 0; t < proc_frames - cfg.conv_lookahead; ++t) {
     const auto &spec_in = spec_buf[t + cfg.conv_lookahead];
     for (int b = 0; b < cfg.nb_erb; ++b) {
       size_t b_start = b * n_freq / cfg.nb_erb;
