@@ -67,10 +67,13 @@ static Config parse_config(const std::string &path) {
   return c;
 }
 
-static std::vector<float> hann(int n) {
+static std::vector<float> vorbis_window(int n) {
   std::vector<float> w(n);
-  for (int i = 0; i < n; ++i)
-    w[i] = 0.5f - 0.5f * std::cos(2 * M_PI * i / n);
+  int half = n / 2;
+  for (int i = 0; i < n; ++i) {
+    double sinv = std::sin(0.5 * M_PI * (static_cast<double>(i) + 0.5) / half);
+    w[i] = std::sin(0.5 * M_PI * sinv * sinv);
+  }
   return w;
 }
 
@@ -142,7 +145,9 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   Ort::Session df_dec(env, (base / "df_dec.onnx").c_str(), opts);
 
   size_t n_freq = cfg.fft_size / 2 + 1;
-  auto window = hann(cfg.fft_size);
+  auto window = vorbis_window(cfg.fft_size);
+  float wnorm = 2.f * static_cast<float>(cfg.hop_size) /
+                (static_cast<float>(cfg.fft_size) * static_cast<float>(cfg.fft_size));
 
   SF_INFO info{};
   SNDFILE *infile = sf_open(in_wav.c_str(), SFM_READ, &info);
@@ -181,7 +186,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     }
     dft(frame, spec);
     for (size_t k = 0; k < cfg.fft_size; ++k)
-      spec_noisy[f][k] = spec[k];
+      spec_noisy[f][k] = spec[k] * wnorm;
   }
 
   // Processing buffer with stage-1 output
