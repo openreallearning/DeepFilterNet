@@ -10,6 +10,7 @@
 #include <iostream>
 #include <onnxruntime/core/session/onnxruntime_cxx_api.h>
 #include <sndfile.h>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@ struct Config {
   int nb_erb = 0;
   int nb_df = 0;
   int df_order = 0;
+  int conv_lookahead = 0;
+  int df_lookahead = 0;
 };
 
 static Config parse_config(const std::string &path) {
@@ -55,6 +58,10 @@ static Config parse_config(const std::string &path) {
         c.nb_df = std::stoi(val);
       else if (key == "df_order")
         c.df_order = std::stoi(val);
+      else if (key == "conv_lookahead")
+        c.conv_lookahead = std::stoi(val);
+      else if (key == "df_lookahead")
+        c.df_lookahead = std::stoi(val);
     }
   }
   return c;
@@ -141,13 +148,15 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
 
   size_t hop = cfg.hop_size;
   size_t frames = (audio.size() + hop - 1) / hop;
-  std::vector<float> out(audio.size() + cfg.fft_size, 0.f);
+  size_t lookahead = std::max(cfg.conv_lookahead, cfg.df_lookahead);
+  std::vector<float> out(audio.size() + cfg.fft_size + lookahead * hop, 0.f);
   std::vector<float> frame(cfg.fft_size);
   std::vector<std::complex<float>> spec(cfg.fft_size);
   std::vector<float> erb_feat(cfg.nb_erb);
   std::array<int64_t, 4> enc_in1_shape{1, 1, 1, cfg.nb_erb};
   std::array<int64_t, 4> enc_in2_shape{1, 2, 1, cfg.nb_df};
   std::vector<float> spec_feat(cfg.nb_df * 2);
+  std::deque<std::vector<std::complex<float>>> spec_queue;
   std::deque<std::vector<std::complex<float>>> spec_hist(
       cfg.df_order, std::vector<std::complex<float>>(n_freq));
 
@@ -160,8 +169,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   const char *dec_input_names[] = {"emb", "e3", "e2", "e1", "e0"};
   const char *dec_output_names[] = {"m"};
 
-  for (size_t f = 0; f < frames; ++f) {
-    size_t start = f * hop;
+  for (size_t t = 0; t < frames; ++t) {
+    size_t start = t * hop;
     for (size_t i = 0; i < cfg.fft_size; ++i) {
       float s = 0.f;
       if (start + i < audio.size())
@@ -169,6 +178,8 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       frame[i] = s * window[i];
     }
     dft(frame, spec);
+    spec_queue.push_back(spec);
+
     for (int b = 0; b < cfg.nb_erb; ++b) {
       size_t b_start = b * n_freq / cfg.nb_erb;
       size_t b_end = (b + 1) * n_freq / cfg.nb_erb;
@@ -198,87 +209,69 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     auto emb = std::move(enc_out[4]);
     auto lsnr = enc_out[5].GetTensorMutableData<float>()[0];
 
-
     const float attention_limit_parameter = 100, // db
         min_db_threshould = -6.5,                 // db
         max_db_erb_threshould = 30,              // db
         max_db_df_threshould = 20;               // db
 
-    // Only noise detected, do not apply gain
     bool only_noise_detected = lsnr < min_db_threshould;
     bool clean_speech_signal = lsnr > max_db_erb_threshould;
     bool only_little_noise_detected = lsnr > max_db_df_threshould;
 
-    std::cout << "Local SNR: " << lsnr << " ";
-    if (clean_speech_signal) std::cout << " clean ";
-    if (only_noise_detected) std::cout << " NOISE ";
-    if (only_little_noise_detected) std::cout << " noise ";
-    std::cout << std::endl;
+    if (t >= (size_t)cfg.conv_lookahead) {
+      size_t out_idx = t - cfg.conv_lookahead;
+      auto proc = spec_queue.front();
 
-    std::vector<float> gain_freq(n_freq, 1);
-    std::vector<std::complex<float>> spec_df = spec;
-
-    if (!only_noise_detected && !clean_speech_signal) {
-      // Apply ERB gains
-      std::array<Ort::Value, 5> dec_inputs{
-          std::move(emb), std::move(enc_out[3]), std::move(enc_out[2]),
-          std::move(enc_out[1]), std::move(enc_out[0])};
-
-      // ERB dec convolution
-      auto m_out = erb_dec.Run(Ort::RunOptions{nullptr}, dec_input_names,
-                               dec_inputs.data(), dec_inputs.size(),
-                               dec_output_names, 1);
-      emb = std::move(dec_inputs[0]);
-      float *gains = m_out[0].GetTensorMutableData<float>();
-
-      // Convert ERB gains to frequency gains
-      for (size_t k = 0; k < n_freq; ++k) {
-        // Find the ERB bin based on frequency
-        size_t b = k * cfg.nb_erb / n_freq;
-        gain_freq[k] = gains[b];
-      }
-      for (size_t k = 0; k < n_freq; ++k) {
-        spec[k] *= gain_freq[k];
-      }
-    }
-
-    if (!only_noise_detected && !clean_speech_signal && !only_little_noise_detected) {
-      // Apply DF
-      // DF dec convolution
-      const char *df_dec_input_names[] = {"emb", "c0"};
-      std::array<Ort::Value, 2> df_dec_inputs{std::move(emb), std::move(c0)};
-      const char *df_dec_output_names[] = {"coefs"};
-      auto df_out = df_dec.Run(Ort::RunOptions{nullptr}, df_dec_input_names,
-                               df_dec_inputs.data(), df_dec_inputs.size(),
-                               df_dec_output_names, 1);
-      float *coefs = df_out[0].GetTensorMutableData<float>();
-      for (size_t k = 0; k < cfg.nb_df; ++k)
-        spec_df[k] = 0.f;
-      for (size_t o = 0; o < cfg.df_order; ++o) {
-        const auto &hist = spec_hist[o];
-        for (size_t k = 0; k < cfg.nb_df; ++k) {
-          size_t idx = k * (cfg.df_order * 2) + 2 * o;
-          std::complex<float> c(coefs[idx], coefs[idx + 1]);
-          spec_df[k] += hist[k] * c;
+      if (!only_noise_detected && !clean_speech_signal) {
+        std::array<Ort::Value, 5> dec_inputs{
+            std::move(emb), std::move(enc_out[3]), std::move(enc_out[2]),
+            std::move(enc_out[1]), std::move(enc_out[0])};
+        auto m_out = erb_dec.Run(Ort::RunOptions{nullptr}, dec_input_names,
+                                 dec_inputs.data(), dec_inputs.size(),
+                                 dec_output_names, 1);
+        emb = std::move(dec_inputs[0]);
+        float *gains = m_out[0].GetTensorMutableData<float>();
+        for (size_t k = 0; k < n_freq; ++k) {
+          size_t b = k * cfg.nb_erb / n_freq;
+          proc[k] *= gains[b];
         }
       }
-      for (size_t k = 0; k < cfg.nb_df; ++k)
-        spec[k] *= spec_df[k];
-    }
 
-    if (false) {
-      float atten_lim = std::pow(10.f, -attention_limit_parameter / 20.f);
-      for (size_t k = 0; k < n_freq; ++k) {
-        spec[k] = spec[k] * (1.f - atten_lim) + spec[k] * atten_lim;
+      spec_hist.pop_front();
+      spec_hist.push_back(proc);
+
+      if (!only_noise_detected && !clean_speech_signal &&
+          !only_little_noise_detected) {
+        const char *df_dec_input_names[] = {"emb", "c0"};
+        std::array<Ort::Value, 2> df_dec_inputs{std::move(emb), std::move(c0)};
+        const char *df_dec_output_names[] = {"coefs"};
+        auto df_out = df_dec.Run(Ort::RunOptions{nullptr}, df_dec_input_names,
+                                 df_dec_inputs.data(), df_dec_inputs.size(),
+                                 df_dec_output_names, 1);
+        float *coefs = df_out[0].GetTensorMutableData<float>();
+        std::vector<std::complex<float>> spec_df(cfg.nb_df, {0.f, 0.f});
+        for (size_t o = 0; o < cfg.df_order; ++o) {
+          const auto &hist = spec_hist[o];
+          for (size_t k = 0; k < cfg.nb_df; ++k) {
+            size_t idx = k * (cfg.df_order * 2) + 2 * o;
+            std::complex<float> c(coefs[idx], coefs[idx + 1]);
+            spec_df[k] += hist[k] * c;
+          }
+        }
+        for (size_t k = 0; k < cfg.nb_df; ++k)
+          proc[k] *= spec_df[k];
       }
-    }
 
-    std::vector<float> time(cfg.fft_size);
-    idft(spec, time);
-    for (size_t i = 0; i < cfg.fft_size; ++i) {
-      if (only_noise_detected) out[start + i] = 0;
-      else
-      out[start + i] += time[i] * window[i];
+      std::vector<float> time(cfg.fft_size);
+      idft(proc, time);
+      for (size_t i = 0; i < cfg.fft_size; ++i) {
+        if (only_noise_detected)
+          out[out_idx * hop + i] = 0.f;
+        else
+          out[out_idx * hop + i] += time[i] * window[i];
+      }
+
+      spec_queue.pop_front();
     }
   }
 
@@ -288,7 +281,9 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
     std::cerr << "Failed to open output" << std::endl;
     return 1;
   }
-  sf_writef_float(outfile, out.data(), info.frames);
+  size_t stft_delay = cfg.fft_size - cfg.hop_size;
+  size_t delay = stft_delay + lookahead * hop;
+  sf_writef_float(outfile, out.data() + delay, info.frames);
   sf_close(outfile);
   std::filesystem::remove_all(tmpdir);
   return 0;
