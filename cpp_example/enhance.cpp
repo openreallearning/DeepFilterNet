@@ -152,8 +152,9 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
   std::vector<float> out(audio.size() + cfg.fft_size, 0.f);
   std::vector<float> frame(cfg.fft_size);
   std::vector<std::complex<float>> spec(cfg.fft_size);
-  std::vector<std::vector<std::complex<float>>> spec_buf(proc_frames,
-      std::vector<std::complex<float>>(n_freq));
+  // Store the full spectrum for each frame to allow inverse transforms
+  std::vector<std::vector<std::complex<float>>> spec_buf(
+      proc_frames, std::vector<std::complex<float>>(cfg.fft_size));
   for (size_t f = 0; f < proc_frames; ++f) {
     size_t start = f * hop;
     for (size_t i = 0; i < cfg.fft_size; ++i) {
@@ -163,7 +164,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       frame[i] = s * window[i];
     }
     dft(frame, spec);
-    for (size_t k = 0; k < n_freq; ++k)
+    for (size_t k = 0; k < cfg.fft_size; ++k)
       spec_buf[f][k] = spec[k];
   }
 
