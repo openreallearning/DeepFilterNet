@@ -170,7 +170,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       spec_noisy[f][k] = spec[k];
   }
 
-  // Processing buffer starts with the noisy spectrum
+  // Processing buffer with stage-1 output
   auto spec_proc = spec_noisy;
 
   std::vector<float> erb_feat(cfg.nb_erb);
@@ -278,9 +278,9 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
       for (size_t o = 0; o < cfg.df_order; ++o) {
         int hist_idx = static_cast<int>(t) - static_cast<int>(cfg.df_order) + 1 +
                         static_cast<int>(o) + static_cast<int>(cfg.df_lookahead);
-        if (hist_idx < 0 || hist_idx >= static_cast<int>(spec_proc.size()))
+        if (hist_idx < 0 || hist_idx >= static_cast<int>(spec_noisy.size()))
           continue;
-        const auto &hist = spec_proc[hist_idx];
+        const auto &hist = spec_noisy[hist_idx];
         for (size_t k = 0; k < cfg.nb_df; ++k) {
           size_t idx = k * (cfg.df_order * 2) + 2 * o;
           std::complex<float> c(coefs[idx], coefs[idx + 1]);
@@ -288,7 +288,7 @@ int enhance_file(const std::string &model_tar, const std::string &in_wav,
         }
       }
       for (size_t k = 0; k < cfg.nb_df; ++k)
-        spec_out[k] *= spec_df[k];
+        spec_out[k] = spec_df[k];
     }
 
     if (false) {
