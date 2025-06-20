@@ -101,7 +101,7 @@ static void idft(const std::vector<std::complex<float>> &in,
       float angle = 2 * M_PI * k * n / N;
       sum += in[k] * std::complex<float>(std::cos(angle), std::sin(angle));
     }
-    out[n] = sum.real() / N;
+    out[n] = sum.real();
   }
 }
 
